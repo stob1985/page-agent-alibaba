@@ -523,9 +523,9 @@ async function scrapeUrl(browser, url, allResults) {
 				break
 			}
 
-			// Node.js szinten szűrjük: csak <=1.4M Ft/nm
+			// Csak tájékoztató log: mennyit szűr ki
 			const matching = listings.filter(
-				(l) => !l.ar_per_nm || l.ar_per_nm <= CRITERIA.maxPricePerSqm
+				(l) => l.ar_per_nm && Number(l.ar_per_nm) <= CRITERIA.maxPricePerSqm
 			)
 			allResults.push(...listings) // összes eltároljuk, szűrés a végén
 			console.log(
@@ -650,8 +650,18 @@ async function main() {
 		return true
 	})
 
-	// Szűrés: csak <=1.4M Ft/nm
-	const unique = uniqueAll.filter((l) => !l.ar_per_nm || l.ar_per_nm <= CRITERIA.maxPricePerSqm)
+	// ar_per_nm pótlása ha hiányzik (ár / méret kiszámolva)
+	for (const l of uniqueAll) {
+		if (!l.ar_per_nm && l.ar_ft && l.meret_nm) {
+			l.ar_per_nm = Math.round(l.ar_ft / l.meret_nm)
+		}
+	}
+
+	// Szűrés: CSAK azok maradnak ahol ar_per_nm ISMERT és <= 1.4M Ft/nm
+	// (ha nincs ár/nm adat, kizárjuk — nem engedünk át ismeretlen drágákat)
+	const unique = uniqueAll.filter(
+		(l) => l.ar_per_nm && Number(l.ar_per_nm) <= CRITERIA.maxPricePerSqm
+	)
 
 	console.log(`\n📋 Összes kinyert hirdetés: ${uniqueAll.length} db`)
 	console.log(`🔍 1.4M Ft/nm alatti szűrés után: ${unique.length} db`)
