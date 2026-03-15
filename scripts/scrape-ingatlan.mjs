@@ -135,8 +135,12 @@ async function initPageAgent(page) {
 		document.head.appendChild(el)
 	}, pageAgentScript)
 
-	// Várunk amíg inicializálódik
-	await page.waitForFunction(() => window.pageAgent !== undefined, { timeout: 10000 })
+	// Várunk amíg inicializálódik (navigáció esetén a waitForFunction is dobhat)
+	await page
+		.waitForFunction(() => window.pageAgent !== undefined, { timeout: 10000 })
+		.catch((e) => {
+			throw new Error(`page-agent init sikertelen: ${e.message}`)
+		})
 
 	// Átírjuk a konfigurációt a mi LLM API-nkkal
 	await page.evaluate((config) => {
@@ -274,9 +278,24 @@ async function scrapeUrl(browser, url, allResults) {
 			}
 
 			await page.goto(currentUrl, {
-				waitUntil: 'domcontentloaded',
-				timeout: 30000,
+				waitUntil: 'load',
+				timeout: 45000,
 			})
+
+			// Várunk amíg a hálózat lecsendesedik (JS átirányítások leállnak)
+			try {
+				await page.waitForLoadState('networkidle', { timeout: 8000 })
+			} catch (_) {
+				// networkidle timeout nem végzetes
+			}
+
+			// Ellenőrzés: az oldal az ingatlan.com-on van-e még?
+			const finalUrl = page.url()
+			if (!finalUrl.includes('ingatlan.com')) {
+				console.log(`  ⚠️  Átirányítás: ${finalUrl} — kihagyva`)
+				break
+			}
+			console.log(`  🌐 Betöltött URL: ${finalUrl}`)
 
 			// Várunk a tartalom betöltésére
 			await randomDelay(1500, 3000)
