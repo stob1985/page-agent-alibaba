@@ -167,58 +167,268 @@ async function initPageAgent(page) {
 }
 
 /**
- * Ingatlan adatok kinyerése egy listázó oldalról az AI agent segítségével
+ * Magyar számformátum értelmezése (pl. "45 000 000", "45M", "45,5 M")
+ */
+function parseHunPrice(str) {
+	if (!str) return null
+	const s = str.replace(/\s/g, '').replace(',', '.')
+	// "45M" vagy "45.5M" → millió forint
+	const mMatch = s.match(/([\d.]+)\s*[Mm]/)
+	if (mMatch) return Math.round(parseFloat(mMatch[1]) * 1_000_000)
+	// sima szám
+	const num = parseFloat(s.replace(/[^\d.]/g, ''))
+	return isNaN(num) ? null : Math.round(num)
+}
+
+function parseHunSize(str) {
+	if (!str) return null
+	const s = str.replace(/\s/g, '').replace(',', '.')
+	const num = parseFloat(s.replace(/[^\d.]/g, ''))
+	return isNaN(num) || num === 0 ? null : Math.round(num)
+}
+
+/**
+ * Ingatlan adatok kinyerése DOM-ból közvetlenül (AI-mentes, megbízható)
  */
 async function extractListings(page, url) {
-	console.log(`\n🔍 Oldal elemzése: ${url}`)
+	console.log(`\n🔍 Oldal elemzése (DOM): ${url}`)
 
-	const task = `
-Az ingatlan.com listázó oldalon lévő ÖSSZES hirdetést gyűjtsd ki. Ne szűrj semmit!
-
-Utasítások:
-1. Görgess végig az összes hirdetésen az oldalon
-2. Minden hirdetésnél olvasd le: cím, ár (Ft), méret (nm), négyzetméterár (Ft/nm), link URL
-3. Ha a négyzetméterár nincs feltüntetve, számold ki: ár / méret
-4. Az ÖSSZES hirdetést add vissza, ne hagyj ki egyet sem!
-
-Válaszolj KIZÁRÓLAG valid JSON tömbként, semmi más szöveg:
-[
-  {
-    "cim": "...",
-    "ar_ft": 95000000,
-    "meret_nm": 65,
-    "ar_per_nm": 1461538,
-    "url": "https://ingatlan.com/..."
-  }
-]
-
-Ha nincs hirdetés az oldalon: []
-`
-
-	try {
-		const result = await page.evaluate(async (taskText) => {
-			return await window.pageAgent.execute(taskText)
-		}, task)
-
-		if (result.success && result.data) {
-			try {
-				// Parse JSON from result
-				const jsonMatch = result.data.match(/\[[\s\S]*\]/)
-				if (jsonMatch) {
-					const listings = JSON.parse(jsonMatch[0])
-					console.log(`  ✅ ${listings.length} ingatlan találva`)
-					return listings
-				}
-			} catch (e) {
-				console.log(`  ⚠️  JSON parse hiba, nyers adat:`, result.data.substring(0, 200))
-			}
-		} else {
-			console.log(`  ❌ Agent hiba:`, result.data)
+	// Görgetés hogy minden kártya betöltsön (lazy load)
+	await page.evaluate(async () => {
+		for (let i = 0; i < 5; i++) {
+			window.scrollBy(0, window.innerHeight)
+			await new Promise((r) => setTimeout(r, 600))
 		}
-	} catch (e) {
-		console.error(`  ❌ Kritikus hiba:`, e.message)
+		window.scrollTo(0, 0)
+	})
+	await randomDelay(800, 1500)
+
+	// Debug: HTML struktúra ellenőrzése
+	const pageInfo = await page.evaluate(() => {
+		const counts = {
+			articles: document.querySelectorAll('article').length,
+			cards: document.querySelectorAll('[class*="card"]').length,
+			listings: document.querySelectorAll('[class*="listing"]').length,
+			liElements: document.querySelectorAll('ul li').length,
+		}
+		// JSON-LD keresése
+		const jsonLds = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(
+			(s) => s.textContent.substring(0, 100)
+		)
+		// window.__INITIAL_STATE__ keresése
+		const hasInitState = typeof window.__INITIAL_STATE__ !== 'undefined'
+		const hasNextData = typeof window.__NEXT_DATA__ !== 'undefined'
+		// body class
+		const bodyClass = document.body.className.substring(0, 100)
+		return { counts, jsonLds: jsonLds.slice(0, 3), hasInitState, hasNextData, bodyClass }
+	})
+	console.log(`  📐 Oldal struktúra:`, JSON.stringify(pageInfo.counts))
+	if (pageInfo.hasNextData) console.log(`  ✅ __NEXT_DATA__ megtalálva`)
+	if (pageInfo.hasInitState) console.log(`  ✅ __INITIAL_STATE__ megtalálva`)
+
+	// 1. kísérlet: Next.js __NEXT_DATA__ (legmegbízhatóbb)
+	const nextDataListings = await page.evaluate(() => {
+		try {
+			if (!window.__NEXT_DATA__) return null
+			const data = window.__NEXT_DATA__
+			// Keressük a hirdetés listát mélyen a pageProps-ban
+			const search = (obj, depth = 0) => {
+				if (depth > 8 || !obj || typeof obj !== 'object') return null
+				if (
+					Array.isArray(obj) &&
+					obj.length > 0 &&
+					obj[0]?.id &&
+					(obj[0]?.price || obj[0]?.listingId || obj[0]?.listing_id)
+				)
+					return obj
+				for (const key of Object.keys(obj)) {
+					if (
+						['listings', 'results', 'items', 'cards', 'properties'].includes(key) &&
+						Array.isArray(obj[key]) &&
+						obj[key].length > 0
+					) {
+						return obj[key]
+					}
+					const found = search(obj[key], depth + 1)
+					if (found) return found
+				}
+				return null
+			}
+			return search(data)
+		} catch (e) {
+			return null
+		}
+	})
+
+	if (nextDataListings && nextDataListings.length > 0) {
+		console.log(`  ✅ Next.js adatból ${nextDataListings.length} hirdetés`)
+		// Normalizáljuk az adatokat
+		return nextDataListings
+			.map((item) => {
+				const price = item.price?.value || item.price || item.listingPrice || null
+				const size = item.area || item.size || item.floorArea || null
+				const arPrNm = price && size ? Math.round(price / size) : null
+				return {
+					cim: item.title || item.address || item.street || '',
+					ar_ft: price,
+					meret_nm: size,
+					ar_per_nm: item.pricePerMeter || item.unitPrice || arPrNm,
+					url: item.url || item.link || (item.id ? `https://ingatlan.com/${item.id}` : null),
+					_forrás: 'next_data',
+				}
+			})
+			.filter((i) => i.url)
 	}
 
+	// 2. kísérlet: JSON-LD structured data
+	const jsonLdListings = await page.evaluate(() => {
+		try {
+			const scripts = document.querySelectorAll('script[type="application/ld+json"]')
+			for (const s of scripts) {
+				const data = JSON.parse(s.textContent)
+				if (data['@type'] === 'ItemList' && data.itemListElement) {
+					return data.itemListElement.map((item) => ({
+						cim: item.name || item.item?.name || '',
+						ar_ft: item.item?.offers?.price || null,
+						meret_nm: null,
+						ar_per_nm: null,
+						url: item.url || item.item?.url || null,
+						_forrás: 'json_ld',
+					}))
+				}
+			}
+		} catch (_) {}
+		return null
+	})
+
+	if (jsonLdListings && jsonLdListings.length > 0) {
+		console.log(`  ✅ JSON-LD-ből ${jsonLdListings.length} hirdetés`)
+		return jsonLdListings.filter((i) => i.url)
+	}
+
+	// 3. kísérlet: DOM scraping — ingatlan.com kártya elemek
+	const domListings = await page.evaluate(() => {
+		const results = []
+
+		// Különböző szelektorok az ingatlan.com különböző verzióihoz
+		const cardSelectors = [
+			'article.listing-card',
+			'article[data-id]',
+			'[data-testid="listing-card"]',
+			'.listing-card',
+			'.property-card',
+			'[class*="ListingCard"]',
+			'[class*="listing-card"]',
+			'[class*="PropertyCard"]',
+		]
+
+		let cards = []
+		for (const sel of cardSelectors) {
+			const found = document.querySelectorAll(sel)
+			if (found.length > 0) {
+				cards = Array.from(found)
+				break
+			}
+		}
+
+		// Ha nem sikerült kártyákat találni, próbáljuk az article elemeket
+		if (cards.length === 0) {
+			cards = Array.from(document.querySelectorAll('article')).filter(
+				(a) => a.querySelector('a[href*="/"]') && a.textContent.includes('Ft')
+			)
+		}
+
+		for (const card of cards) {
+			// URL
+			const linkEl = card.querySelector('a[href*="ingatlan.com"], a[href^="/"]')
+			const href = linkEl?.getAttribute('href') || ''
+			const url = href.startsWith('http') ? href : href ? `https://ingatlan.com${href}` : null
+			if (!url) continue
+
+			// Cím
+			const cimEl = card.querySelector(
+				'h2, h3, [class*="title"], [class*="address"], [class*="cim"]'
+			)
+			const cim = cimEl?.textContent?.trim() || ''
+
+			// Az összes szöveget megkapjuk a kártyából
+			const szoveg = card.textContent || ''
+
+			// Ár (Ft) — különböző formátumok
+			let ar_ft = null
+			const arEl = card.querySelector('[class*="price"], [class*="ar"], [class*="Price"]')
+			const arSzoveg = arEl?.textContent || szoveg
+			const arMatch =
+				arSzoveg.match(/([\d\s]+(?:[,.][\d]+)?)\s*(?:M\s*Ft|millió\s*Ft|mFt)/i) ||
+				arSzoveg.match(/([\d\s]{5,})\s*Ft/)
+			if (arMatch) {
+				const raw = arMatch[1].replace(/\s/g, '').replace(',', '.')
+				const num = parseFloat(raw)
+				if (!isNaN(num)) {
+					// Ha "M Ft" → szorozzuk millióval
+					ar_ft = arMatch[0].toLowerCase().includes('m')
+						? Math.round(num * 1_000_000)
+						: Math.round(num)
+				}
+			}
+
+			// Méret (nm / m²)
+			let meret_nm = null
+			const meretMatch = szoveg.match(/([\d]+(?:[,.][\d]+)?)\s*(?:m²|nm|m2)/i)
+			if (meretMatch) {
+				meret_nm = Math.round(parseFloat(meretMatch[1].replace(',', '.')))
+			}
+
+			// Ár/nm
+			let ar_per_nm = null
+			const arNmMatch = szoveg.match(/([\d\s]+(?:[,.][\d]+)?)\s*(?:Ft\/nm|Ft\/m²|ezer\s*Ft\/nm)/i)
+			if (arNmMatch) {
+				const raw = arNmMatch[1].replace(/\s/g, '').replace(',', '.')
+				const num = parseFloat(raw)
+				if (!isNaN(num)) {
+					ar_per_nm = arNmMatch[0].toLowerCase().includes('ezer')
+						? Math.round(num * 1000)
+						: Math.round(num)
+				}
+			}
+			// Ha nincs explicite megadva, kiszámoljuk
+			if (!ar_per_nm && ar_ft && meret_nm) {
+				ar_per_nm = Math.round(ar_ft / meret_nm)
+			}
+
+			results.push({ cim, ar_ft, meret_nm, ar_per_nm, url, _forrás: 'dom' })
+		}
+
+		return results
+	})
+
+	if (domListings && domListings.length > 0) {
+		console.log(`  ✅ DOM-ból ${domListings.length} hirdetés kinyerve`)
+		return domListings
+	}
+
+	// 4. kísérlet: page-agent AI fallback (ha DOM sem működött)
+	console.log(`  ⚠️  DOM üres, page-agent fallback...`)
+	try {
+		await initPageAgent(page)
+		const result = await page.evaluate(async () => {
+			return await window.pageAgent.execute(
+				'List ALL property listings on this page as JSON array: [{cim, ar_ft (number), meret_nm (number), ar_per_nm (number), url}]. Return ONLY the JSON array, nothing else.'
+			)
+		})
+		if (result.success && result.data) {
+			const jsonMatch = result.data.match(/\[[\s\S]*\]/)
+			if (jsonMatch) {
+				const listings = JSON.parse(jsonMatch[0])
+				console.log(`  ✅ AI fallback: ${listings.length} hirdetés`)
+				return listings
+			}
+		}
+	} catch (e) {
+		console.error(`  ❌ AI fallback hiba:`, e.message)
+	}
+
+	console.log(`  ❌ Nincs hirdetés kinyerve ezen az oldalon`)
 	return []
 }
 
@@ -305,10 +515,7 @@ async function scrapeUrl(browser, url, allResults) {
 			await humanMouseMove(page)
 			await humanScroll(page)
 
-			// page-agent inicializálása (click eszközök letiltva, csak scroll+done)
-			await initPageAgent(page)
-
-			// Adatok kinyerése az AI agent segítségével (ÖSSZES hirdetés, szűrés nélkül)
+			// Adatok kinyerése DOM-ból (AI csak fallback)
 			const listings = await extractListings(page, currentUrl)
 
 			if (listings.length === 0) {
@@ -325,44 +532,39 @@ async function scrapeUrl(browser, url, allResults) {
 				`  📊 ${listings.length} hirdetés kinyerve, ebből ${matching.length} megfelelő (összesen eddig: ${allResults.length})`
 			)
 
-			// Ellenőrzés: van-e következő oldal a DOM-ban?
-			const hasNextPage = await page.evaluate(() => {
-				// Próbáljuk megtalálni a "következő oldal" linket vagy gombot
+			// Lapozás vége ellenőrzés:
+			// 1. Ha az URL visszaállt az 1. oldalra (az oldal nem fogadja a ?page=N paramétert)
+			if (pageNum > 1) {
+				const finalUrlObj = new URL(finalUrl)
+				const returnedPage = finalUrlObj.searchParams.get('page')
+				if (!returnedPage || returnedPage !== String(pageNum)) {
+					console.log(`  ✅ Nincs több oldal (URL nem tartalmazza: page=${pageNum})`)
+					break
+				}
+			}
+
+			// 2. DOM-ban sincs "következő" gomb/link
+			const hasNextPage = await page.evaluate((nextPageNum) => {
 				const selectors = [
 					'a[rel="next"]',
-					'.pagination a[aria-label*="következő"]',
-					'.pagination a[aria-label*="next"]',
 					'[data-testid="pagination-next"]',
 					'.pagination__next',
 					'a.next',
 				]
 				for (const sel of selectors) {
 					const el = document.querySelector(sel)
-					if (el && !el.hasAttribute('disabled')) return true
+					if (el && !el.hasAttribute('disabled') && el.tagName !== 'SPAN') return true
 				}
-				// Ha nincs explicit "next" gomb, ellenőrizzük hogy létezik-e az aktuális oldal utáni oldal link
-				const pageLinks = document.querySelectorAll('.pagination a, [class*="pagination"] a')
-				for (const link of pageLinks) {
-					const href = link.getAttribute('href') || ''
-					if (href.includes(`page=${window._currentPage + 1}`)) return true
+				// Keres olyan linket ami a következő lapszámra mutat
+				const allLinks = document.querySelectorAll('a[href]')
+				for (const link of allLinks) {
+					if (link.getAttribute('href')?.includes(`page=${nextPageNum}`)) return true
 				}
 				return false
-			})
+			}, pageNum + 1)
 
-			// Ha az oldal visszairányított az 1. oldalra (nincs ?page=X a végső URL-ben de kértük)
-			if (pageNum > 1 && !finalUrl.includes(`page=${pageNum}`)) {
-				// Lehet hogy a page param a hash-ben vagy más helyen van
-				// Ha az URL visszaugrik, akkor nincs több oldal
-				const urlObj = new URL(finalUrl)
-				const urlPage = urlObj.searchParams.get('page')
-				if (!urlPage && pageNum > 1) {
-					console.log('  ✅ Nincs több oldal (URL visszaállt az 1. oldalra)')
-					break
-				}
-			}
-
-			if (!hasNextPage && pageNum > 1) {
-				console.log('  ✅ Nincs több oldal (pagination)')
+			if (!hasNextPage) {
+				console.log('  ✅ Nincs több oldal')
 				break
 			}
 
