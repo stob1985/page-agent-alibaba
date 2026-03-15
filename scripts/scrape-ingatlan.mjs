@@ -125,69 +125,6 @@ async function humanMouseMove(page) {
 }
 
 /**
- * JS szintű navigáció-blokkoló injektálása az oldalba.
- * A page.route() csak hálózati szinten blokkol (az execution context
- * már megsemmisül mire a kérés elindul), ezért szükséges a JS-szintű tiltás.
- */
-async function injectNavigationBlocker(page) {
-	await page.evaluate(() => {
-		// Location.prototype metódusok felülírása
-		try {
-			window.Location.prototype.assign = function (url) {
-				console.warn('[nav-blocked] location.assign:', url)
-			}
-			window.Location.prototype.replace = function (url) {
-				console.warn('[nav-blocked] location.replace:', url)
-			}
-			Object.defineProperty(window.Location.prototype, 'href', {
-				get: function () {
-					return window.location.toString()
-				},
-				set: function (url) {
-					console.warn('[nav-blocked] location.href =', url)
-				},
-				configurable: true,
-			})
-		} catch (e) {
-			console.warn('[nav-blocked] Location.prototype override hiba:', e)
-		}
-
-		// history API blokkolása
-		window.history.pushState = () => undefined
-		window.history.replaceState = () => undefined
-
-		// Form submit blokkolása
-		document.addEventListener(
-			'submit',
-			(e) => {
-				e.preventDefault()
-				e.stopImmediatePropagation()
-			},
-			true
-		)
-
-		// Link kattintások blokkolása (ahol más útvonalra vinne)
-		document.addEventListener(
-			'click',
-			(e) => {
-				const a = e.target instanceof HTMLAnchorElement ? e.target : e.target.closest?.('a')
-				if (a?.href) {
-					const dest = new URL(a.href, window.location.href)
-					if (dest.pathname !== window.location.pathname) {
-						e.preventDefault()
-						e.stopImmediatePropagation()
-						console.warn('[nav-blocked] link kattintás:', a.href)
-					}
-				}
-			},
-			true
-		)
-
-		console.log('[nav-blocked] Navigáció-blokkoló aktív')
-	})
-}
-
-/**
  * page-agent inicializálása az oldalon
  */
 async function initPageAgent(page) {
@@ -198,29 +135,39 @@ async function initPageAgent(page) {
 		document.head.appendChild(el)
 	}, pageAgentScript)
 
-	// Várunk amíg inicializálódik (navigáció esetén a waitForFunction is dobhat)
+	// Várunk amíg inicializálódik
 	await page
 		.waitForFunction(() => window.pageAgent !== undefined, { timeout: 10000 })
 		.catch((e) => {
 			throw new Error(`page-agent init sikertelen: ${e.message}`)
 		})
 
-	// Átírjuk a konfigurációt a mi LLM API-nkkal
+	// Átírjuk a konfigurációt a mi LLM API-nkkal.
+	// customTools: a kattintás-eszközöket letiltjuk, hogy az agent ne navigáljon el az oldalról.
+	// instructions.system: rendszerszintű utasítás az agent számára.
 	await page.evaluate((config) => {
-		// Dispose the demo agent
 		if (window.pageAgent) {
 			window.pageAgent.dispose()
 		}
 
-		// Create new agent with our config
 		window.pageAgent = new window.PageAgent({
 			model: config.model,
 			apiKey: config.apiKey,
 			baseURL: config.baseURL,
 			language: 'hu',
+			// Letiltjuk az interakciós eszközöket: csak scroll + done marad
+			customTools: {
+				click_element_by_index: null,
+				input_text: null,
+				select_dropdown_option: null,
+			},
+			instructions: {
+				system:
+					'You are a data extraction agent. Your ONLY job is to read the current page and extract listing data. Do NOT navigate away from this page. Do NOT click any links. Only use scroll to see more content, then call done with the extracted JSON.',
+			},
 		})
 
-		console.log('🤖 page-agent újrainicializálva:', config.model)
+		console.log('🤖 page-agent inicializálva (csak scroll+done):', config.model)
 	}, LLM_CONFIG)
 
 	await randomDelay(500, 1000)
@@ -381,32 +328,11 @@ async function scrapeUrl(browser, url, allResults) {
 			await humanMouseMove(page)
 			await humanScroll(page)
 
-			// Blokkolja a top-level navigációt amíg a page-agent fut
-			// (ingatlan.com anti-bot JS időzített átirányítást végezhet)
-			const blockNav = (route, request) => {
-				if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
-					console.log(`  🚫 Navigáció blokkolva: ${request.url().substring(0, 80)}`)
-					route.abort()
-				} else {
-					route.continue()
-				}
-			}
-			await page.route('**/*', blockNav)
+			// page-agent inicializálása (click eszközök letiltva, csak scroll+done)
+			await initPageAgent(page)
 
-			let listings = []
-			try {
-				// JS szintű navigáció-blokkoló injektálása (mielőtt a page-agent fut)
-				await injectNavigationBlocker(page)
-
-				// page-agent inicializálása
-				await initPageAgent(page)
-
-				// Adatok kinyerése az AI agent segítségével
-				listings = await extractListings(page, currentUrl)
-			} finally {
-				// Navigáció-blokk feloldása (következő oldal betöltéséhez)
-				await page.unroute('**/*', blockNav)
-			}
+			// Adatok kinyerése az AI agent segítségével
+			const listings = await extractListings(page, currentUrl)
 
 			// Szűrt eredmények hozzáadása
 			const matching = listings.filter((l) => l.megfelel !== false)
