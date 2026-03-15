@@ -38,14 +38,7 @@ const CRITERIA = {
 
 // --- Keresési URL-ek ---
 const SEARCH_URLS = [
-	// XI. ker. - Sasad és Bartók Béla út környéke (felújítandó)
-	'https://ingatlan.com/xi-ker/elado+lakas?allapot=felujitando',
-	// XII. ker. (felújítandó)
-	'https://ingatlan.com/xii-ker/elado+lakas?allapot=felujitando',
-	// II. ker. (felújítandó)
-	'https://ingatlan.com/ii-ker/elado+lakas?allapot=felujitando',
-	// I. ker. (felújítandó)
-	'https://ingatlan.com/i-ker/elado+lakas?allapot=felujitando',
+	'https://ingatlan.com/lista/elado+lakas+felujitando+1-2-emelet+120-mFt-ig+panoramas+utcai-kilatas+kertre-nezo+i-ker+ii-ker+xi-ker+xii-ker',
 ]
 
 // --- LLM konfiguráció ---
@@ -180,45 +173,31 @@ async function extractListings(page, url) {
 	console.log(`\n🔍 Oldal elemzése: ${url}`)
 
 	const task = `
-Elemezd az ingatlan.com listázó oldalt és keresd ki az összes lakás hirdetést.
+Az ingatlan.com listázó oldalon CSAK az alábbi EGYETLEN szűrési feltétel alapján válogasd ki a hirdetéseket:
 
-Keresési feltételek:
-- Maximum ár: 120 millió Ft (120 000 000 Ft)
-- Maximum négyzetméterár: 1,4 millió Ft/nm
-- Emelet: 1. emelet vagy magasabb. HA 2. emelet vagy magasabb, AKKOR csak liftes épület!
-- Nézetirány: utcai, kertre néző, vagy panorámás
-- Épület állapota: jó (nem rossz)
-- Épület kora: 1950 előtt VAGY 1980 után épült
-- Fűtés: bármilyen
-- Lakás állapota: befejezetlen VAGY felújítandó
+SZŰRÉS: Négyzetméterár maximum 1 400 000 Ft/nm (1,4 millió Ft/nm)
 
-FONTOS KORLÁTOZÁS: NE navigálj el erről az oldalról! Ne kattints semmilyen linkre, ne töltsd be újra az oldalt, ne navigálj más URL-re. Csak az aktuálisan látható tartalom alapján dolgozz.
+Az URL már tartalmazza az összes többi szűrést (felújítandó, 1-2. emelet, max 120M Ft, panorámás/utcai/kertre néző, I-II-XI-XII. kerület).
+Neked csak a négyzetméterár-feltételt kell ellenőrizni: ha az oldalon látható négyzetméterár > 1 400 000 Ft/nm, az a hirdetés NEM felel meg.
 
 Utasítások:
-1. Görgess végig az összes hirdetésen az oldalon (CSAK scroll, ne kattints linkre)
-2. Minden egyes hirdetésnél nézd meg: ár, méret, négyzetméterár, cím, emelet, lift, tájolás, épület kora, állapot
-3. Szűrd ki azokat amelyek NEM felelnek meg a feltételeknek
-4. Gyűjtsd össze az összes megfelelő hirdetést
+1. Görgess végig az összes hirdetésen az oldalon
+2. Minden hirdetésnél olvasd le: cím, ár (Ft), méret (nm), négyzetméterár (Ft/nm), link URL
+3. Ha a négyzetméterár nincs feltüntetve, számold ki: ár / méret
+4. Csak azokat vedd fel, ahol négyzetméterár <= 1 400 000 Ft/nm
 
-Válaszolj KIZÁRÓLAG valid JSON tömbként, a következő formátumban (semmi más szöveg):
+Válaszolj KIZÁRÓLAG valid JSON tömbként, semmi más szöveg:
 [
   {
     "cim": "...",
     "ar_ft": 95000000,
     "meret_nm": 65,
     "ar_per_nm": 1461538,
-    "emelet": "2",
-    "lift": true,
-    "tajolas": "utcai",
-    "epulet_eve": 1935,
-    "allapot": "felújítandó",
-    "url": "https://ingatlan.com/...",
-    "megfelel": true,
-    "nem_megfelel_oka": ""
+    "url": "https://ingatlan.com/..."
   }
 ]
 
-Ha nem találsz megfelelő ingatlant, adj vissza üres tömböt: []
+Ha nincs megfelelő ingatlan: []
 `
 
 	try {
@@ -334,8 +313,11 @@ async function scrapeUrl(browser, url, allResults) {
 			// Adatok kinyerése az AI agent segítségével
 			const listings = await extractListings(page, currentUrl)
 
-			// Szűrt eredmények hozzáadása
-			const matching = listings.filter((l) => l.megfelel !== false)
+			// Az agent már csak a megfelelő (<=1.4M Ft/nm) hirdetéseket adja vissza
+			// Node.js szinten is leellenőrizzük biztonságból
+			const matching = listings.filter(
+				(l) => !l.ar_per_nm || l.ar_per_nm <= CRITERIA.maxPricePerSqm
+			)
 			allResults.push(...matching)
 			console.log(
 				`  📊 ${matching.length} megfelelő ingatlan hozzáadva (${allResults.length} összesen)`
@@ -410,9 +392,8 @@ async function main() {
 	try {
 		for (let i = 0; i < SEARCH_URLS.length; i++) {
 			const url = SEARCH_URLS[i]
-			const district = url.match(/\/([-a-z]+)-ker\//)?.[1]?.toUpperCase() || `URL ${i + 1}`
 			console.log(`\n${'='.repeat(50)}`)
-			console.log(`🏙️  ${district}. kerület scrapelése...`)
+			console.log(`🔍 Keresés ${i + 1}/${SEARCH_URLS.length}`)
 			console.log('='.repeat(50))
 
 			await scrapeUrl(browser, url, allResults)
