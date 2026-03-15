@@ -230,6 +230,8 @@ Ha nem találsz megfelelő ingatlant, adj vissza üres tömböt: []
  */
 async function scrapeUrl(browser, url, allResults) {
 	const context = await browser.newContext({
+		// Proxy SSL intercept miatt szükséges
+		ignoreHTTPSErrors: true,
 		// Valódi böngésző user agent
 		userAgent:
 			'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
@@ -337,14 +339,35 @@ async function main() {
 	)
 	console.log(`🔗 ${SEARCH_URLS.length} keresési URL feldolgozása\n`)
 
+	// Proxy konfiguráció a rendszer proxy változókból
+	const systemProxy =
+		process.env.HTTPS_PROXY ||
+		process.env.HTTP_PROXY ||
+		process.env.https_proxy ||
+		process.env.http_proxy
+	let proxyConfig = undefined
+	if (systemProxy) {
+		try {
+			const proxyUrl = new URL(systemProxy)
+			proxyConfig = {
+				server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
+				username: decodeURIComponent(proxyUrl.username),
+				password: decodeURIComponent(proxyUrl.password),
+			}
+			console.log(`🔌 Proxy: ${proxyUrl.hostname}:${proxyUrl.port}`)
+		} catch (e) {
+			console.log('⚠️  Proxy parse hiba, proxy nélkül próbálkozom')
+		}
+	}
+
 	const browser = await chromium.launch({
 		executablePath: '/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome',
-		headless: true, // true a szerver környezetben; false ha látni akarod
+		headless: true,
+		proxy: proxyConfig,
 		args: [
 			'--no-sandbox',
 			'--disable-setuid-sandbox',
-			'--disable-blink-features=AutomationControlled', // Fontos: elrejti az automatizálás jeleit
-			'--disable-web-security',
+			'--disable-blink-features=AutomationControlled',
 			'--disable-features=IsolateOrigins,site-per-process',
 			'--window-size=1366,768',
 		],
