@@ -173,18 +173,13 @@ async function extractListings(page, url) {
 	console.log(`\n🔍 Oldal elemzése: ${url}`)
 
 	const task = `
-Az ingatlan.com listázó oldalon CSAK az alábbi EGYETLEN szűrési feltétel alapján válogasd ki a hirdetéseket:
-
-SZŰRÉS: Négyzetméterár maximum 1 400 000 Ft/nm (1,4 millió Ft/nm)
-
-Az URL már tartalmazza az összes többi szűrést (felújítandó, 1-2. emelet, max 120M Ft, panorámás/utcai/kertre néző, I-II-XI-XII. kerület).
-Neked csak a négyzetméterár-feltételt kell ellenőrizni: ha az oldalon látható négyzetméterár > 1 400 000 Ft/nm, az a hirdetés NEM felel meg.
+Az ingatlan.com listázó oldalon lévő ÖSSZES hirdetést gyűjtsd ki. Ne szűrj semmit!
 
 Utasítások:
 1. Görgess végig az összes hirdetésen az oldalon
 2. Minden hirdetésnél olvasd le: cím, ár (Ft), méret (nm), négyzetméterár (Ft/nm), link URL
 3. Ha a négyzetméterár nincs feltüntetve, számold ki: ár / méret
-4. Csak azokat vedd fel, ahol négyzetméterár <= 1 400 000 Ft/nm
+4. Az ÖSSZES hirdetést add vissza, ne hagyj ki egyet sem!
 
 Válaszolj KIZÁRÓLAG valid JSON tömbként, semmi más szöveg:
 [
@@ -197,7 +192,7 @@ Válaszolj KIZÁRÓLAG valid JSON tömbként, semmi más szöveg:
   }
 ]
 
-Ha nincs megfelelő ingatlan: []
+Ha nincs hirdetés az oldalon: []
 `
 
 	try {
@@ -256,11 +251,14 @@ async function scrapeUrl(browser, url, allResults) {
 	})
 
 	let pageNum = 1
-	let currentUrl = url
+
+	// Alap URL lapszám nélkül (eltávolítjuk ha már van ?page= a végén)
+	const baseUrl = url.replace(/[?&]page=\d+/, '')
 
 	try {
-		while (pageNum <= 5) {
-			// Max 5 oldal per keresés
+		while (pageNum <= 10) {
+			// Max 10 oldal (~200 hirdetés)
+			const currentUrl = pageNum === 1 ? baseUrl : `${baseUrl}?page=${pageNum}`
 			console.log(`  📄 ${pageNum}. oldal betöltése...`)
 
 			// Emberi viselkedés: véletlenszerű késleltetés oldaltöltések között
@@ -310,32 +308,64 @@ async function scrapeUrl(browser, url, allResults) {
 			// page-agent inicializálása (click eszközök letiltva, csak scroll+done)
 			await initPageAgent(page)
 
-			// Adatok kinyerése az AI agent segítségével
+			// Adatok kinyerése az AI agent segítségével (ÖSSZES hirdetés, szűrés nélkül)
 			const listings = await extractListings(page, currentUrl)
 
-			// Az agent már csak a megfelelő (<=1.4M Ft/nm) hirdetéseket adja vissza
-			// Node.js szinten is leellenőrizzük biztonságból
-			const matching = listings.filter(
-				(l) => !l.ar_per_nm || l.ar_per_nm <= CRITERIA.maxPricePerSqm
-			)
-			allResults.push(...matching)
-			console.log(
-				`  📊 ${matching.length} megfelelő ingatlan hozzáadva (${allResults.length} összesen)`
-			)
-
-			// Következő oldal keresése
-			const nextPage = await page.$(
-				'a[rel="next"], .pagination__next, [data-testid="pagination-next"]'
-			)
-			if (!nextPage) {
-				console.log('  ✅ Nincs több oldal')
+			if (listings.length === 0) {
+				console.log('  ✅ Üres oldal — lapozás vége')
 				break
 			}
 
-			const nextHref = await nextPage.getAttribute('href')
-			if (!nextHref) break
+			// Node.js szinten szűrjük: csak <=1.4M Ft/nm
+			const matching = listings.filter(
+				(l) => !l.ar_per_nm || l.ar_per_nm <= CRITERIA.maxPricePerSqm
+			)
+			allResults.push(...listings) // összes eltároljuk, szűrés a végén
+			console.log(
+				`  📊 ${listings.length} hirdetés kinyerve, ebből ${matching.length} megfelelő (összesen eddig: ${allResults.length})`
+			)
 
-			currentUrl = nextHref.startsWith('http') ? nextHref : `https://ingatlan.com${nextHref}`
+			// Ellenőrzés: van-e következő oldal a DOM-ban?
+			const hasNextPage = await page.evaluate(() => {
+				// Próbáljuk megtalálni a "következő oldal" linket vagy gombot
+				const selectors = [
+					'a[rel="next"]',
+					'.pagination a[aria-label*="következő"]',
+					'.pagination a[aria-label*="next"]',
+					'[data-testid="pagination-next"]',
+					'.pagination__next',
+					'a.next',
+				]
+				for (const sel of selectors) {
+					const el = document.querySelector(sel)
+					if (el && !el.hasAttribute('disabled')) return true
+				}
+				// Ha nincs explicit "next" gomb, ellenőrizzük hogy létezik-e az aktuális oldal utáni oldal link
+				const pageLinks = document.querySelectorAll('.pagination a, [class*="pagination"] a')
+				for (const link of pageLinks) {
+					const href = link.getAttribute('href') || ''
+					if (href.includes(`page=${window._currentPage + 1}`)) return true
+				}
+				return false
+			})
+
+			// Ha az oldal visszairányított az 1. oldalra (nincs ?page=X a végső URL-ben de kértük)
+			if (pageNum > 1 && !finalUrl.includes(`page=${pageNum}`)) {
+				// Lehet hogy a page param a hash-ben vagy más helyen van
+				// Ha az URL visszaugrik, akkor nincs több oldal
+				const urlObj = new URL(finalUrl)
+				const urlPage = urlObj.searchParams.get('page')
+				if (!urlPage && pageNum > 1) {
+					console.log('  ✅ Nincs több oldal (URL visszaállt az 1. oldalra)')
+					break
+				}
+			}
+
+			if (!hasNextPage && pageNum > 1) {
+				console.log('  ✅ Nincs több oldal (pagination)')
+				break
+			}
+
 			pageNum++
 
 			// Hosszabb szünet oldalak között (emberi viselkedés)
@@ -412,11 +442,17 @@ async function main() {
 
 	// Eredmények deduplikálása URL alapján
 	const seen = new Set()
-	const unique = allResults.filter((r) => {
+	const uniqueAll = allResults.filter((r) => {
 		if (!r.url || seen.has(r.url)) return false
 		seen.add(r.url)
 		return true
 	})
+
+	// Szűrés: csak <=1.4M Ft/nm
+	const unique = uniqueAll.filter((l) => !l.ar_per_nm || l.ar_per_nm <= CRITERIA.maxPricePerSqm)
+
+	console.log(`\n📋 Összes kinyert hirdetés: ${uniqueAll.length} db`)
+	console.log(`🔍 1.4M Ft/nm alatti szűrés után: ${unique.length} db`)
 
 	// Ár szerint rendezve
 	unique.sort((a, b) => (a.ar_ft || 0) - (b.ar_ft || 0))
