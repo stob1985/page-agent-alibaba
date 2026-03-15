@@ -125,6 +125,69 @@ async function humanMouseMove(page) {
 }
 
 /**
+ * JS szintű navigáció-blokkoló injektálása az oldalba.
+ * A page.route() csak hálózati szinten blokkol (az execution context
+ * már megsemmisül mire a kérés elindul), ezért szükséges a JS-szintű tiltás.
+ */
+async function injectNavigationBlocker(page) {
+	await page.evaluate(() => {
+		// Location.prototype metódusok felülírása
+		try {
+			window.Location.prototype.assign = function (url) {
+				console.warn('[nav-blocked] location.assign:', url)
+			}
+			window.Location.prototype.replace = function (url) {
+				console.warn('[nav-blocked] location.replace:', url)
+			}
+			Object.defineProperty(window.Location.prototype, 'href', {
+				get: function () {
+					return window.location.toString()
+				},
+				set: function (url) {
+					console.warn('[nav-blocked] location.href =', url)
+				},
+				configurable: true,
+			})
+		} catch (e) {
+			console.warn('[nav-blocked] Location.prototype override hiba:', e)
+		}
+
+		// history API blokkolása
+		window.history.pushState = () => undefined
+		window.history.replaceState = () => undefined
+
+		// Form submit blokkolása
+		document.addEventListener(
+			'submit',
+			(e) => {
+				e.preventDefault()
+				e.stopImmediatePropagation()
+			},
+			true
+		)
+
+		// Link kattintások blokkolása (ahol más útvonalra vinne)
+		document.addEventListener(
+			'click',
+			(e) => {
+				const a = e.target instanceof HTMLAnchorElement ? e.target : e.target.closest?.('a')
+				if (a?.href) {
+					const dest = new URL(a.href, window.location.href)
+					if (dest.pathname !== window.location.pathname) {
+						e.preventDefault()
+						e.stopImmediatePropagation()
+						console.warn('[nav-blocked] link kattintás:', a.href)
+					}
+				}
+			},
+			true
+		)
+
+		console.log('[nav-blocked] Navigáció-blokkoló aktív')
+	})
+}
+
+/**
  * page-agent inicializálása az oldalon
  */
 async function initPageAgent(page) {
@@ -182,8 +245,10 @@ Keresési feltételek:
 - Fűtés: bármilyen
 - Lakás állapota: befejezetlen VAGY felújítandó
 
+FONTOS KORLÁTOZÁS: NE navigálj el erről az oldalról! Ne kattints semmilyen linkre, ne töltsd be újra az oldalt, ne navigálj más URL-re. Csak az aktuálisan látható tartalom alapján dolgozz.
+
 Utasítások:
-1. Görgess végig az összes hirdetésen az oldalon
+1. Görgess végig az összes hirdetésen az oldalon (CSAK scroll, ne kattints linkre)
 2. Minden egyes hirdetésnél nézd meg: ár, méret, négyzetméterár, cím, emelet, lift, tájolás, épület kora, állapot
 3. Szűrd ki azokat amelyek NEM felelnek meg a feltételeknek
 4. Gyűjtsd össze az összes megfelelő hirdetést
@@ -330,6 +395,9 @@ async function scrapeUrl(browser, url, allResults) {
 
 			let listings = []
 			try {
+				// JS szintű navigáció-blokkoló injektálása (mielőtt a page-agent fut)
+				await injectNavigationBlocker(page)
+
 				// page-agent inicializálása
 				await initPageAgent(page)
 
