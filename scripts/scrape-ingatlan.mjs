@@ -316,11 +316,29 @@ async function scrapeUrl(browser, url, allResults) {
 			await humanMouseMove(page)
 			await humanScroll(page)
 
-			// page-agent inicializálása
-			await initPageAgent(page)
+			// Blokkolja a top-level navigációt amíg a page-agent fut
+			// (ingatlan.com anti-bot JS időzített átirányítást végezhet)
+			const blockNav = (route, request) => {
+				if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+					console.log(`  🚫 Navigáció blokkolva: ${request.url().substring(0, 80)}`)
+					route.abort()
+				} else {
+					route.continue()
+				}
+			}
+			await page.route('**/*', blockNav)
 
-			// Adatok kinyerése az AI agent segítségével
-			const listings = await extractListings(page, currentUrl)
+			let listings = []
+			try {
+				// page-agent inicializálása
+				await initPageAgent(page)
+
+				// Adatok kinyerése az AI agent segítségével
+				listings = await extractListings(page, currentUrl)
+			} finally {
+				// Navigáció-blokk feloldása (következő oldal betöltéséhez)
+				await page.unroute('**/*', blockNav)
+			}
 
 			// Szűrt eredmények hozzáadása
 			const matching = listings.filter((l) => l.megfelel !== false)
