@@ -223,8 +223,20 @@ async function extractListings(page, url) {
 		return { counts, jsonLds: jsonLds.slice(0, 3), hasInitState, hasNextData, bodyClass }
 	})
 	console.log(`  📐 Oldal struktúra:`, JSON.stringify(pageInfo.counts))
+	console.log(`  📐 JSON-LD:`, pageInfo.jsonLds)
+	console.log(`  📐 Body class:`, pageInfo.bodyClass)
 	if (pageInfo.hasNextData) console.log(`  ✅ __NEXT_DATA__ megtalálva`)
 	if (pageInfo.hasInitState) console.log(`  ✅ __INITIAL_STATE__ megtalálva`)
+
+	// DEBUG: HTML dump — hogy lássuk az ingatlan.com struktúráját
+	{
+		const htmlDump = await page.evaluate(() => document.body?.innerHTML?.substring(0, 10000) || '')
+		const dumpPath = join(ROOT, 'debug-page-dump.html')
+		if (!existsSync(dumpPath)) {
+			writeFileSync(dumpPath, htmlDump, 'utf8')
+			console.log(`  💾 HTML dump mentve: ${dumpPath}`)
+		}
+	}
 
 	// 1. kísérlet: Next.js __NEXT_DATA__ (legmegbízhatóbb)
 	const nextDataListings = await page.evaluate(() => {
