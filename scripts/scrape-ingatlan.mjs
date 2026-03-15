@@ -363,7 +363,6 @@ async function main() {
 	}
 
 	const browser = await chromium.launch({
-		executablePath: '/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome',
 		headless: true,
 		proxy: proxyConfig,
 		args: [
