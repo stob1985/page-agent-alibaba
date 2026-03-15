@@ -16,8 +16,15 @@ import { dirname, join } from 'path'
 import { chromium } from 'playwright'
 import { fileURLToPath } from 'url'
 
+import { BRIDGE_HOST, BRIDGE_PORT, startBridge } from './proxy-bridge.mjs'
+
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(__dirname, '..')
+
+// --- User proxy (megvásárolt residential proxy) ---
+// Beállítható env változóval is: USER_PROXY_URL=http://user:pass@host:port
+const USER_PROXY_URL =
+	process.env.USER_PROXY_URL || 'http://obccpvrt:8g01793iry4x@31.59.20.176:6754'
 
 // --- Keresési feltételek ---
 const CRITERIA = {
@@ -339,24 +346,19 @@ async function main() {
 	)
 	console.log(`🔗 ${SEARCH_URLS.length} keresési URL feldolgozása\n`)
 
-	// Proxy konfiguráció a rendszer proxy változókból
-	const systemProxy =
-		process.env.HTTPS_PROXY ||
-		process.env.HTTP_PROXY ||
-		process.env.https_proxy ||
-		process.env.http_proxy
+	// Proxy híd indítása: localhost → Anthropic proxy → user proxy → ingatlan.com
+	let bridgeServer = null
 	let proxyConfig = undefined
-	if (systemProxy) {
+
+	if (process.env.HTTPS_PROXY || process.env.HTTP_PROXY) {
 		try {
-			const proxyUrl = new URL(systemProxy)
-			proxyConfig = {
-				server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
-				username: decodeURIComponent(proxyUrl.username),
-				password: decodeURIComponent(proxyUrl.password),
-			}
-			console.log(`🔌 Proxy: ${proxyUrl.hostname}:${proxyUrl.port}`)
+			bridgeServer = await startBridge(USER_PROXY_URL)
+			proxyConfig = { server: `http://${BRIDGE_HOST}:${BRIDGE_PORT}` }
+			console.log(
+				`🔌 Proxy lánc: Playwright → localhost:${BRIDGE_PORT} → user proxy → ingatlan.com`
+			)
 		} catch (e) {
-			console.log('⚠️  Proxy parse hiba, proxy nélkül próbálkozom')
+			console.log(`⚠️  Proxy híd hiba: ${e.message}, proxy nélkül próbálkozom`)
 		}
 	}
 
@@ -394,6 +396,7 @@ async function main() {
 		}
 	} finally {
 		await browser.close()
+		if (bridgeServer) bridgeServer.close()
 	}
 
 	// Eredmények deduplikálása URL alapján
