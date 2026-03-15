@@ -337,13 +337,18 @@ async function extractListings(page, url) {
 		]
 
 		let cards = []
+		let usedSel = ''
 		for (const sel of cardSelectors) {
 			const found = document.querySelectorAll(sel)
 			if (found.length > 0) {
 				cards = Array.from(found)
+				usedSel = sel
 				break
 			}
 		}
+		if (cards.length === 0) return { _debug: 'no cards found' }
+		const c0 = cards[0]
+		const _debug = `sel=${usedSel} count=${cards.length} tag=${c0.tagName} href=${c0.getAttribute('href') || c0.querySelector('a')?.getAttribute('href')}`
 
 		// Ha nem sikerült kártyákat találni, próbáljuk az article elemeket
 		if (cards.length === 0) {
@@ -353,8 +358,9 @@ async function extractListings(page, url) {
 		}
 
 		for (const card of cards) {
-			// URL
-			const linkEl = card.querySelector('a[href*="ingatlan.com"], a[href^="/"]')
+			// URL — a kártya maga is lehet <a> elem
+			const linkEl =
+				card.tagName === 'A' ? card : card.querySelector('a[href*="ingatlan.com"], a[href^="/"]')
 			const href = linkEl?.getAttribute('href') || ''
 			const url = href.startsWith('http') ? href : href ? `https://ingatlan.com${href}` : null
 			if (!url) continue
@@ -413,12 +419,14 @@ async function extractListings(page, url) {
 			results.push({ cim, ar_ft, meret_nm, ar_per_nm, url, _forrás: 'dom' })
 		}
 
-		return results
+		return { _debug, results }
 	})
 
-	if (domListings && domListings.length > 0) {
-		console.log(`  ✅ DOM-ból ${domListings.length} hirdetés kinyerve`)
-		return domListings
+	if (domListings?._debug) console.log(`  📐 DOM debug: ${domListings._debug}`)
+	const domResults = domListings?.results ?? domListings
+	if (Array.isArray(domResults) && domResults.length > 0) {
+		console.log(`  ✅ DOM-ból ${domResults.length} hirdetés kinyerve`)
+		return domResults
 	}
 
 	// 4. kísérlet: page-agent AI fallback (ha DOM sem működött)
